@@ -1,0 +1,17 @@
+{
+  "name": "pi-plugins",
+  "version": "0.1.0",
+  "description": "Collection of personal pi extensions (otel-viewer, session-manager, ...)",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "otel-viewer/src/index.ts",
+      "session-manager/index.ts"
+    ]
+  }
+}
