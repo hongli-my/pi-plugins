@@ -79,7 +79,7 @@ export default function sessionManagerExtension(pi: ExtensionAPI) {
           return;
         }
 
-        const sessionName = session.name || basename(session.file);
+        const sessionName = session.name || labelFromFile(session.file);
         await ctx.switchSession(session.file, {
           withSession: async (ctx) => {
             ctx.ui.notify(`Switched to: ${sessionName}`, "info");
@@ -143,9 +143,13 @@ class SessionPicker {
 
   private buildItems(): SelectItem[] {
     return this.sessionInfos.map((s) => {
-      const name = s.name || basename(s.file).replace(/\.jsonl$/, '');
+      // Flatten the name too: a user-set session name may contain newlines/
+      // control characters, which would break the row layout the same way raw
+      // previews used to. Cap long names so the preview/date stay visible.
+      const name = s.name ? truncate(flattenText(s.name), 28) : labelFromFile(s.file);
       const isCurrent = s.file === this.currentFile;
-      const preview = s.firstMessage ? truncate(s.firstMessage, 45) : "(no messages)";
+      const flattened = s.firstMessage ? flattenText(s.firstMessage) : "";
+      const preview = flattened ? truncate(flattened, 45) : "(no messages)";
       const date = formatDate(s.lastModified);
       return {
         value: s.file,
@@ -381,8 +385,18 @@ class SessionPicker {
  */
 async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
   const sessionInfos: SessionInfo[] = [];
+  const seen = new Set<string>();
 
-  // Method 1: SessionManager.list()
+  const addInfo = (info: SessionInfo | null | undefined) => {
+    if (!info) return;
+    if (seen.has(info.file)) return;
+    seen.add(info.file);
+    sessionInfos.push(info);
+  };
+
+  // Method 1: SessionManager.list() — respects pi's session discovery rules,
+  // but skips session files without a `session` header entry (e.g. resumed
+  // or forked sessions), so it can miss real sessions.
   try {
     const result = await SessionManager.list(cwd);
     if (Array.isArray(result)) {
@@ -391,8 +405,7 @@ async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
 
       for (const session of sessions) {
         try {
-          const info = await getSessionInfo(session.path);
-          if (info) sessionInfos.push(info);
+          addInfo(await getSessionInfo(session.path));
         } catch (error) {
           console.error(`Failed to read ${session.path}:`, error);
         }
@@ -402,37 +415,40 @@ async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
     console.error(`[session-manager] list() failed:`, error);
   }
 
-  // Method 2: Direct read
-  if (sessionInfos.length === 0) {
-    try {
-      const sessionsBaseDir = join(homedir(), '.pi', 'agent', 'sessions');
-      const dirs = await readdir(sessionsBaseDir, { withFileTypes: true });
+  // Method 2: Direct read of the cwd session dir. Always runs so sessions
+  // that list() skipped (no `session` header) still show up, deduped by path.
+  try {
+    const sessionsBaseDir = join(homedir(), '.pi', 'agent', 'sessions');
+    const dirs = await readdir(sessionsBaseDir, { withFileTypes: true });
 
-      const cwdNormalized = cwd.replace(/\//g, '-');
-      const matchingDir = dirs.find(d =>
-        d.isDirectory() &&
-        d.name.includes(cwdNormalized)
-      );
+    const cwdNormalized = cwd.replace(/\//g, '-');
+    const matchingDir = dirs.find(d =>
+      d.isDirectory() &&
+      d.name.includes(cwdNormalized)
+    );
 
-      if (matchingDir) {
-        const sessionDir = join(sessionsBaseDir, matchingDir.name);
-        const files = await readdir(sessionDir);
-        const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+    if (matchingDir) {
+      const sessionDir = join(sessionsBaseDir, matchingDir.name);
+      const files = await readdir(sessionDir);
+      const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
 
-        for (const file of jsonlFiles) {
-          try {
-            const info = await getSessionInfo(join(sessionDir, file));
-            if (info) sessionInfos.push(info);
-          } catch (error) {
-            console.error(`Failed to read ${file}:`, error);
+      let directCount = 0;
+      for (const file of jsonlFiles) {
+        try {
+          const info = await getSessionInfo(join(sessionDir, file));
+          if (info) {
+            addInfo(info);
+            directCount++;
           }
+        } catch (error) {
+          console.error(`Failed to read ${file}:`, error);
         }
-
-        console.error(`[session-manager] Direct read found ${sessionInfos.length} sessions`);
       }
-    } catch (error) {
-      console.error(`[session-manager] Direct read failed:`, error);
+
+      console.error(`[session-manager] Direct read found ${directCount} session files (${sessionInfos.length} unique)`);
     }
+  } catch (error) {
+    console.error(`[session-manager] Direct read failed:`, error);
   }
 
   return sessionInfos;
@@ -469,8 +485,10 @@ async function readSessionFile(filePath: string): Promise<any> {
     try {
       const entry = JSON.parse(line);
       entries.push(entry);
-      if (entry.type === "session" && entry.name) {
-        name = entry.name;
+      // pi stores user-defined display names in `session_info` entries.
+      // The latest entry wins; an empty name clears the display name.
+      if (entry.type === "session_info") {
+        name = typeof entry.name === "string" ? entry.name.trim() || undefined : undefined;
       }
     } catch (e) {
       // Skip invalid lines
@@ -521,4 +539,26 @@ function formatDate(date: Date): string {
 function truncate(str: string, max: number): string {
   if (str.length <= max) return str;
   return str.slice(0, max - 3) + "...";
+}
+
+/**
+ * Flatten control characters (newlines, tabs, etc.) so a session preview is
+ * always a single line. pi session files store raw user messages, which
+ * may contain newlines; embedding them in a rendered line breaks the layout.
+ * (Same approach as pi's own session selector.)
+ */
+function flattenText(str: string): string {
+  return str.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Derive a human-readable label from pi's session filename
+ * (e.g. "2026-08-21T09-15-54-579Z_01a0239a-....jsonl" -> "2026-08-21 09:15:54").
+ * Falls back to the bare filename for other formats.
+ */
+function labelFromFile(file: string): string {
+  const base = basename(file).replace(/\.jsonl$/, '');
+  const m = base.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]} ${m[2]}:${m[3]}:${m[4]}`;
+  return base;
 }
