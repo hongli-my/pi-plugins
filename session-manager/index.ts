@@ -8,9 +8,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
-import { stat, readdir, readFile, unlink } from "node:fs/promises";
+import { stat, readdir, readFile, unlink, appendFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
+
+const DEBUG_LOG = join(homedir(), ".pi", "agent", "session-manager-debug.log");
+
+/**
+ * Debug output must never go to stdout/stderr: pi's TUI only manages stdout, so
+ * a stray console.* call paints over the rendered frame and leaves junk at the
+ * bottom of the screen. Log to a file instead, and only when asked to.
+ */
+function debugLog(...args: unknown[]): void {
+  if (process.env.PI_SESSION_MANAGER_DEBUG !== "1") return;
+  const line = args
+    .map((a) => (a instanceof Error ? a.stack ?? a.message : typeof a === "string" ? a : JSON.stringify(a)))
+    .join(" ");
+  void appendFile(DEBUG_LOG, `${new Date().toISOString()} ${line}\n`).catch(() => {});
+}
 
 interface SessionInfo {
   file: string;
@@ -87,7 +102,7 @@ export default function sessionManagerExtension(pi: ExtensionAPI) {
         });
 
       } catch (error) {
-        console.error('[session-manager] Error in /sessions:', error);
+        debugLog('[session-manager] Error in /sessions:', error);
         ctx.ui.notify(`Error: ${error}`, "error");
       }
     },
@@ -160,6 +175,13 @@ class SessionPicker {
   }
 
   handleInput(data: string): void {
+    // Ctrl+C is pi's cancel key. Handle it here too, otherwise the only exits
+    // (Esc / q) are non-obvious and an empty list looks like a stuck dialog.
+    if (matchesKey(data, Key.ctrl("c"))) {
+      this.onDone(null);
+      return;
+    }
+
     // Handle Ctrl+D for delete (double-press)
     if (matchesKey(data, Key.ctrl("d"))) {
       this.handleCtrlD();
@@ -311,50 +333,54 @@ class SessionPicker {
     lines.push("");
 
     if (this.items.length === 0) {
-      lines.push(theme.fg("dim", "  No sessions"));
-      return lines;
-    }
-
-    // Render items with selection highlight
-    const maxVisible = 20;
-    const half = Math.floor(maxVisible / 2);
-    let start = Math.max(0, this.selectedIndex - half);
-    const end = Math.min(this.items.length, start + maxVisible);
-    if (end - start < maxVisible) {
-      start = Math.max(0, end - maxVisible);
-    }
-
-    for (let i = start; i < end; i++) {
-      const item = this.items[i];
-      const isSelected = i === this.selectedIndex;
-      const isCurrent = item.value === this.currentFile;
-      const prefix = isSelected ? "▶ " : "  ";
-      let line = prefix + item.label;
-      if (item.description) {
-        line += "  " + theme.fg("muted", item.description);
+      lines.push(truncateToWidth(theme.fg("dim", "  No sessions for this project"), width));
+    } else {
+      // Render items with selection highlight
+      const maxVisible = 20;
+      const half = Math.floor(maxVisible / 2);
+      let start = Math.max(0, this.selectedIndex - half);
+      const end = Math.min(this.items.length, start + maxVisible);
+      if (end - start < maxVisible) {
+        start = Math.max(0, end - maxVisible);
       }
-      let styledLine: string;
-      if (isSelected) {
-        styledLine = theme.fg("accent", line);
-      } else if (isCurrent) {
-        styledLine = theme.fg("dim", line);
-      } else {
-        styledLine = line;
-      }
-      lines.push(truncateToWidth(styledLine, width));
-    }
 
-    // Scroll indicator
-    if (this.items.length > maxVisible) {
-      lines.push(truncateToWidth(
-        theme.fg("dim", `  (${this.selectedIndex + 1}/${this.items.length})`),
-        width
-      ));
+      for (let i = start; i < end; i++) {
+        const item = this.items[i];
+        const isSelected = i === this.selectedIndex;
+        const isCurrent = item.value === this.currentFile;
+        const prefix = isSelected ? "▶ " : "  ";
+        let line = prefix + item.label;
+        if (item.description) {
+          line += "  " + theme.fg("muted", item.description);
+        }
+        let styledLine: string;
+        if (isSelected) {
+          styledLine = theme.fg("accent", line);
+        } else if (isCurrent) {
+          styledLine = theme.fg("dim", line);
+        } else {
+          styledLine = line;
+        }
+        lines.push(truncateToWidth(styledLine, width));
+      }
+
+      // Scroll indicator
+      if (this.items.length > maxVisible) {
+        lines.push(truncateToWidth(
+          theme.fg("dim", `  (${this.selectedIndex + 1}/${this.items.length})`),
+          width
+        ));
+      }
     }
 
     // Status line (inline, not a notify popup)
     lines.push("");
-    if (this.statusMessage) {
+    if (this.items.length === 0) {
+      lines.push(truncateToWidth(
+        theme.fg("dim", "Press Esc / q / Ctrl+C to close"),
+        width
+      ));
+    } else if (this.statusMessage) {
       const color = this.statusMessage.startsWith("⚠") || this.statusMessage.startsWith("✗")
         ? "error"
         : this.statusMessage.startsWith("Press Ctrl+D")
@@ -401,18 +427,18 @@ async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
     const result = await SessionManager.list(cwd);
     if (Array.isArray(result)) {
       const sessions = result.filter(s => s && typeof s.path === 'string');
-      console.error(`[session-manager] list() returned ${sessions.length} sessions`);
+      debugLog(`[session-manager] list() returned ${sessions.length} sessions`);
 
       for (const session of sessions) {
         try {
           addInfo(await getSessionInfo(session.path));
         } catch (error) {
-          console.error(`Failed to read ${session.path}:`, error);
+          debugLog(`Failed to read ${session.path}:`, error);
         }
       }
     }
   } catch (error) {
-    console.error(`[session-manager] list() failed:`, error);
+    debugLog(`[session-manager] list() failed:`, error);
   }
 
   // Method 2: Direct read of the cwd session dir. Always runs so sessions
@@ -421,10 +447,14 @@ async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
     const sessionsBaseDir = join(homedir(), '.pi', 'agent', 'sessions');
     const dirs = await readdir(sessionsBaseDir, { withFileTypes: true });
 
-    const cwdNormalized = cwd.replace(/\//g, '-');
+    // Match pi's default session dir naming exactly (see pi's
+    // getDefaultSessionDirPath). A substring match is wrong: for
+    // .../StarRocks/starrocks it also matches .../StarRocks/starrocks-fe,
+    // and find() may return that unrelated (empty) directory.
+    const expectedDirName = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
     const matchingDir = dirs.find(d =>
-      d.isDirectory() &&
-      d.name.includes(cwdNormalized)
+      (d.isDirectory() || d.isSymbolicLink()) &&
+      d.name === expectedDirName
     );
 
     if (matchingDir) {
@@ -441,14 +471,14 @@ async function getSessionInfos(cwd: string): Promise<SessionInfo[]> {
             directCount++;
           }
         } catch (error) {
-          console.error(`Failed to read ${file}:`, error);
+          debugLog(`Failed to read ${file}:`, error);
         }
       }
 
-      console.error(`[session-manager] Direct read found ${directCount} session files (${sessionInfos.length} unique)`);
+      debugLog(`[session-manager] Direct read found ${directCount} session files (${sessionInfos.length} unique)`);
     }
   } catch (error) {
-    console.error(`[session-manager] Direct read failed:`, error);
+    debugLog(`[session-manager] Direct read failed:`, error);
   }
 
   return sessionInfos;

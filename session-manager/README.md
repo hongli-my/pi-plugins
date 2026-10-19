@@ -36,7 +36,7 @@ Restart pi or run `/reload` to load it. The `/sessions` command will then be ava
 | `↑` / `↓` or `k` / `j` | Navigate (wraps around) |
 | `Enter` | Switch to the selected session |
 | `Ctrl+D` then `Ctrl+D` | Delete the selected session |
-| `Esc` / `q` | Cancel |
+| `Esc` / `q` / `Ctrl+C` | Close the picker |
 
 ### Deleting
 
@@ -48,7 +48,8 @@ The current session cannot be deleted from the picker; select another first.
 
 ## Technical Details
 
-- Session discovery uses `SessionManager.list(cwd)` (primary), with a direct `~/.pi/agent/sessions` directory scan as a fallback.
+- Session discovery uses `SessionManager.list(cwd)` (primary), with a direct `~/.pi/agent/sessions` directory scan as a fallback. The fallback matches pi's encoded directory name exactly (`--<cwd with / \ : replaced by ->--`); a substring match would also hit sibling checkouts like `.../starrocks-fe`.
+- The extension never writes to stdout/stderr — pi's TUI only manages stdout, so `console.*` output corrupts the rendered frame. Set `PI_SESSION_MANAGER_DEBUG=1` to log to `~/.pi/agent/session-manager-debug.log` instead.
 - Each session file (JSONL) is parsed to extract the display name, first user message, and entry count.
 - Switching is performed via `ctx.switchSession()`.
 - The picker is a custom TUI component built with `ctx.ui.custom()`.
