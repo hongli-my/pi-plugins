@@ -1,7 +1,7 @@
 {
   "name": "pi-plugins",
   "version": "0.1.0",
-  "description": "Collection of personal pi extensions (otel-viewer, session-manager, ...)",
+  "description": "Collection of personal pi extensions (otel-viewer, session-manager, pi-mcp-skills, ...)",
   "keywords": ["pi-package"],
   "type": "module",
   "peerDependencies": {
@@ -11,7 +11,8 @@
   "pi": {
     "extensions": [
       "otel-viewer/src/index.ts",
-      "session-manager/index.ts"
+      "session-manager/index.ts",
+      "pi-mcp-skills/index.ts"
     ]
   }
 }
